@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "schematic"
+name = "formless"
 dynamic = ["version"]
 description = ''
 readme = "README.rst"
@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [tool.hatch.version]
-path = "src/schematic/__about__.py"
+path = "src/formless/__about__.py"
 
 [tool.hatch.envs.default]
 dependencies = [
@@ -56,19 +56,19 @@ dependencies = [
   "mypy>=1.0.0",
 ]
 [tool.hatch.envs.types.scripts]
-check = "mypy --install-types --non-interactive {args:src/schematic tests}"
+check = "mypy --install-types --non-interactive {args:src/formless tests}"
 
 [tool.coverage.run]
-source_pkgs = ["schematic", "tests"]
+source_pkgs = ["formless", "tests"]
 branch = true
 parallel = true
 omit = [
-  "src/schematic/__about__.py",
+  "src/formless/__about__.py",
 ]
 
 [tool.coverage.paths]
-schematic = ["src/schematic", "*/schematic/src/schematic"]
-tests = ["tests", "*/schematic/tests"]
+formless = ["src/formless", "*/formless/src/formless"]
+tests = ["tests", "*/formless/tests"]
 
 [tool.coverage.report]
 exclude_lines = [
