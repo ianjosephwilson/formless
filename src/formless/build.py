@@ -3,22 +3,31 @@
 import logging
 from formencode import Schema, Invalid
 from formencode.api import FancyValidator
-from formencode.validators import FormValidator, Int, UnicodeString, Empty, NotEmpty, ConfirmType, Set, OneOf, Bool
+from formencode.validators import FormValidator, Int, String, Empty, NotEmpty, ConfirmType, Set, OneOf, Bool, Number
 from formencode.compound import Pipe, Any as AnyMatch
 from dataclasses import dataclass, field, fields, is_dataclass, MISSING
 from typing import Any, Optional, get_origin, get_args, Annotated, Union
-from types import UnionType, NoneType
+from types import UnionType, NoneType, SimpleNamespace
 from inspect import get_annotations
-import logging
+from itertools import chain
+
+
 logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
+
+
+class OurMetadata(SimpleNamespace):
+    """ Use in Annotated to pass arguments to formencode. """
+    pass
+
 
 @dataclass
 class Profile:
     image_url: str
     width: int
     height: int
+
 
 @dataclass
 class User:
@@ -29,10 +38,25 @@ class User:
      email: str | None = None
      verified: Any = (1, 2)
      username: str = ""
-     num_logins: int = 0
+     num_logins: Annotated[int, OurMetadata(min=0)] = 0
      is_person: bool = False
-     
+     # @TODO: Handle tuples, fixed and variable, mixed: Maybe just make a custom validator to handle this madness.
+     empty_tuple: tuple[()]
+     tuple_of_any1: tuple
+     tuple_of_any2: tuple[Any, ...]
+     tuple_of_ints: tuple[int, ...]
+     tuple_of_int: tuple[int]
+     union_of_tuple_types: tuple[()]|tuple[int]|tuple[int, int]
+     # What madman is doing this?
+     tuple_of_mixed: tuple[int, str]
 
+     # Maybe a ForEach(Any(Int(), String()))
+     mixed_list: list[int|str]
+
+     # I'm not sure formencode supports this.
+     mixed_dict: dict[str|int, str|int]
+
+     # @TODO: Handle state based on depth? based on key? based on global state?
 
 class BaseSchema(Schema):
     """Schema with sane settings."""
@@ -70,11 +94,64 @@ def index_or_default(items, item, default=None):
 NOT_SET = object()
 PLACEHOLDER = object()
 
+
 @dataclass
-class OurMetadata:
-    not_empty: bool|None = None
-    if_empty: Any|None = NOT_SET
-    if_missing: Any|None = NOT_SET
+class VSpec:
+    """ Specification to create a validator. """
+    # Callable with *args and **kwargs to create validator .
+    factory: Any
+    # List of args to pass to factory, meant to be mutated.
+    args: list|None
+    # List of kwargs to pass to factory, meant to be mutated.
+    kwargs: dict|None
+
+
+@dataclass
+class VSpecProvider:
+    """ Simple validator specification provider. """
+    name: str
+    factory: Any
+    args: list = field(default_factory=list)
+    kwargs: dict = field(default_factory=dict)
+    include_classes: tuple = ()
+    exclude_classes: tuple = ()
+
+    def provide_vspec(self, origin, args):
+        if issubclass(origin, self.include_classes) and (not self.exclude_classes or not issubclass(origin, self.exclude_classes)):
+            return VSpec(
+                factory=self.factory,
+                args=self.args if self.args is not None else [],
+                kwargs=self.kwargs if self.kwargs is not None else {})
+
+
+class DataclassFactory(FancyValidator):
+    accept_iterator = True
+    # ? not sure what this should be
+    #compound = True
+    __unpackargs__ = ['target']
+
+    def _convert_to_python(self, value, state):
+        # Remove placeholder we injected earlier so the dataclass can use its own default mechanism.
+        return self.target(**{k: v for (k, v) in value.items() if v is not PLACEHOLDER})
+
+
+class PassThrough(FancyValidator):
+    def _convert_to_python(self, value, state):
+        return value
+
+
+general_providers = (
+    VSpecProvider("int", include_classes=(int,), exclude_classes=(bool,), factory=Int),
+    VSpecProvider("float", include_classes=(float,), factory=Number),
+    VSpecProvider("str", include_classes=(str,), factory=String),
+    VSpecProvider("types.NoneType", include_classes=(NoneType,), factory=ConfirmType, kwargs=dict(subclass=NoneType)),
+    VSpecProvider("typing.Any", include_classes=(Any,), factory=PassThrough),
+    VSpecProvider("set", include_classes=(set,), factory=Set, kwargs=dict(use_set=True)),
+    VSpecProvider("bool", include_classes=(bool,), factory=Bool),
+    # @TODO: There is no decimal validator.
+    #VSpecProvider("decimal.Decimal", include_classes=(bool,), factory=Decimal),
+)
+
 
 @dataclass
 class SchemaBuilder:
@@ -83,9 +160,12 @@ class SchemaBuilder:
     and coerce the output a json.loads-type structure into the root object
     and all nested objects (all the way down, turtles).
     """
-    def merge_metadata(self, items):
-        #raise Warning('This is not complete')
-        return items[0] if items else None
+    debug: bool = False
+    provide_for_unions: bool = True
+    providers: tuple = general_providers
+
+    def merge_metadatas(self, metadatas):
+        return dict(chain(*(m.__dict__.items() for m in metadatas)))
 
     def get_validator(self, annotation, field_obj=NOT_SET, part_of_field_obj=NOT_SET, metadata=None):
         """ Resolve a validator for the given annotation. """
@@ -94,8 +174,9 @@ class SchemaBuilder:
             # Unwrap annotation and keep metadata.
             source_type = a_args[0]
             a_args = get_args(annotation)
-            metadata = self.merge_metadata([m for m in annotation.__metadata__ if isinstance(m, OurMetadata)])
+            metadata = self.merge_metadatas([m for m in annotation.__metadata__ if isinstance(m, OurMetadata)])
         else:
+            metadata = None
             source_type = annotation
         origin = get_origin(source_type)
         # Plain types don't return an origin.
@@ -107,14 +188,12 @@ class SchemaBuilder:
             origin = UnionType
 
         default_set = field_obj is not NOT_SET and (field_obj.default is not MISSING or field_obj.default_factory is not MISSING)
-        v = None
-        v_args = []
-        v_kwargs = {}
 
-        if issubclass(origin, NoneType):
-            v = ConfirmType
-            v_kwargs['subclass'] = NoneType
-        elif issubclass(origin, UnionType) :
+        vspec = None
+        # We could probably shoehorn both the union check and namespace check into
+        # the provider list but the api would be terrible and I don't think it is
+        # worth it at this point.
+        if self.provide_for_unions and issubclass(origin, UnionType):
             # This handles
             # - Optional[t]
             # - Union[t1, ...]
@@ -123,39 +202,38 @@ class SchemaBuilder:
             # Note that nested unions, including a union inside Optional are
             # flattened by get_args / get_origin.
             v = AnyMatch
+            v_args = []
             # There should realistically be only one of these as I understand it.
             none_types = [t for t in a_args if issubclass(t, NoneType)]
             v_args.extend([self.get_validator(t, part_of_field_obj=field_obj) for t in a_args if not issubclass(t, NoneType)])
             if none_types:
                 v_args.append(self.get_validator(none_types[0], part_of_field_obj=field_obj))
-        elif issubclass(origin, Any):
-            # @TODO: Is there a better way to handle this?
-            v = PassThrough
-        elif issubclass(origin, str):
-            v = UnicodeString
-        elif issubclass(origin, bool):
-            # This must come before int.
-            v = Bool
-        elif issubclass(origin, int):
-            v = Int
-        elif issubclass(origin, set):
-            v = Set
-            v_kwargs['use_set'] = True
-            # @TODO: When should we recurse?
-        elif self.is_namespace(origin):
-            v = self.build
-            v_args.append(origin)
-        if v is None:
+            vspec = VSpec(factory=v, args=v_args, kwargs={})
+        else:
+            for provider in self.providers:
+                vspec = provider.provide_vspec(origin, a_args)
+                if vspec:
+                    break
+        if not vspec and self.is_namespace(origin):
+            vspec = VSpec(
+                factory=self.build,
+                args=[origin],
+                kwargs={})
+
+        if not vspec:
             raise InvalidTarget(f'Unsupported type {origin}')
         if default_set:
             # @TODO: Or can just inject a value to remove later.
             #default = field_obj.default if field_obj.default else field_obj.default_factory()
-            v_kwargs['if_missing'] = PLACEHOLDER
-            v_kwargs['if_empty'] = PLACEHOLDER
-        elif v == self.build or (not issubclass(v, AnyMatch) and not issubclass(v, PassThrough)):
-            v_kwargs['not_empty'] = True
-        logger.info(f'Resolved {field_obj.name if field_obj is not NOT_SET else None}:{annotation}:{origin}:{a_args} to {v}(*{v_args}, **{v_kwargs})')
-        return v(*v_args, **v_kwargs)
+            vspec.kwargs['if_missing'] = PLACEHOLDER
+            vspec.kwargs['if_empty'] = PLACEHOLDER
+        elif vspec.factory == self.build or (not issubclass(vspec.factory, AnyMatch) and not issubclass(vspec.factory, PassThrough)):
+            vspec.kwargs['not_empty'] = True
+        if metadata:
+            vspec.kwargs.update(metadata)
+        if self.debug:
+            logger.debug(f'Resolved {field_obj.name if field_obj is not NOT_SET else None}:{annotation}:{origin}:{a_args} to {v}(*{v_args}, **{v_kwargs})')
+        return vspec.factory(*vspec.args if vspec.args else (), **(vspec.kwargs if vspec.kwargs else {}))
 
     def is_namespace(self, obj):
         """ Is this a namespace-like structure we can """
@@ -179,20 +257,9 @@ class SchemaBuilder:
         return Pipe(BaseSchema(**kwargs), DataclassFactory(target=target))
 
 
-class DataclassFactory(FancyValidator):
-    accept_iterator = True
-    # ? not sure what this should be
-    #compound = True
-    __unpackargs__ = ['target']
+def pretty_print_schema(schema):
+    pass
 
-    def _convert_to_python(self, value, state):
-        # Remove placeholder we injected earlier so the dataclass can use its own default mechanism.
-        return self.target(**{k: v for (k, v) in value.items() if v is not PLACEHOLDER})
-
-
-class PassThrough(FancyValidator):
-    def _convert_to_python(self, value, state):
-        return value
 
 def main():
     msg = {
@@ -203,6 +270,7 @@ def main():
          ],
          "email":None,
          "is_person": 7,
+        'num_logins': 0,
         "profile": {
             "image_url": "/mugshot.png",
             "width": 100,
@@ -214,20 +282,11 @@ def main():
     schema = builder.build(User)
     from pprint import pprint
     pprint(schema)# (f'built schema {schema}')
-    pprint (schema.to_python(msg))
+    try:
+        pprint(schema.to_python(msg))
+    except Invalid as e:
+        pprint (e.unpack_errors())
 
-
-@dataclass
-class Num2:
-    num2: int
-    num3: int
-
-@dataclass
-class Num1:
-    num1: int
-    nested: Num2|None
 
 if __name__ == '__main__':
     main()
-
-    # What if we just rewrote formencode validators to use dataclasses or structs?
